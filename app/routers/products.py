@@ -8,7 +8,7 @@ from app.auth import get_current_seller
 from app.models.products import Product as ProductModel
 from app.models.categories import Category as CategoryModel
 from app.schemas import Product as ProductSchema, ProductCreate
-from app.db_depends import get_db, get_async_db
+from app.db_depends import get_async_db
 
 
 router = APIRouter(
