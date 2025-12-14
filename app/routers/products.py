@@ -7,7 +7,8 @@ from app.models.users import User as UserModel
 from app.auth import get_current_seller
 from app.models.products import Product as ProductModel
 from app.models.categories import Category as CategoryModel
-from app.schemas import Product as ProductSchema, ProductCreate
+from app.models.reviews import Review as ReviewModel
+from app.schemas import Product as ProductSchema, ProductCreate, Review as ReviewSchema
 from app.db_depends import get_async_db
 
 
@@ -67,6 +68,39 @@ async def get_products_by_category(category_id: int, db: AsyncSession = Depends(
         select(ProductModel).where(ProductModel.category_id == category_id, ProductModel.is_active == True)
     )
     return product_result.all()
+
+
+@router.get("/{product_id}/reviews/", response_model=list[ReviewSchema])
+async def get_product_reviews(
+    product_id: int,
+    db: AsyncSession = Depends(get_async_db)
+):
+    """
+    Возвращает список активных отзывов для указанного товара.
+    Доступ: Разрешён всем (аутентификация не требуется).
+    """
+    # Проверяем, существует ли активный товар
+    product_result = await db.scalars(
+        select(ProductModel).where(
+            ProductModel.id == product_id,
+            ProductModel.is_active == True
+        )
+    )
+    product = product_result.first()
+    if not product:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Product not found or inactive"
+        )
+    
+    # Получаем активные отзывы для товара
+    reviews_result = await db.scalars(
+        select(ReviewModel).where(
+            ReviewModel.product_id == product_id,
+            ReviewModel.is_active == True
+        )
+    )
+    return reviews_result.all()
 
 
 @router.get("/{product_id}", response_model=ProductSchema)
