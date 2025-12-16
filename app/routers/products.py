@@ -1,14 +1,13 @@
-from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy import select, update
-from sqlalchemy.orm import Session
+from fastapi import APIRouter, Depends, HTTPException, Query, status
+from sqlalchemy import desc, func, or_, select, update
+# from sqlalchemy.orm import Session
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.users import User as UserModel
 from app.auth import get_current_seller
 from app.models.products import Product as ProductModel
 from app.models.categories import Category as CategoryModel
-from app.models.reviews import Review as ReviewModel
-from app.schemas import Product as ProductSchema, ProductCreate, Review as ReviewSchema
+from app.schemas import Product as ProductSchema, ProductCreate, ProductList
 from app.db_depends import get_async_db
 
 
@@ -39,13 +38,96 @@ async def create_product(
     return db_product
 
 
-@router.get("/", response_model=list[ProductSchema])
-async def get_all_products(db: AsyncSession = Depends(get_async_db)):
-    """
-    Возвращает список всех активных товаров.
-    """
-    result = await db.scalars(select(ProductModel).where(ProductModel.is_active == True))
-    return result.all()
+@router.get("/", response_model=ProductList)
+async def get_all_products(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+    category_id: int | None = Query(None, description="ID категории для фильтрации"),
+    search: str | None = Query(None, min_length=1, description="Поиск по названию/описанию"),
+    min_price: float | None = Query(None, ge=0, description="Минимальная цена товара"),
+    max_price: float | None = Query(None, ge=0, description="Максимальная цена товара"),
+    in_stock: bool | None = Query(None, description="true — только товары в наличии, false — только без остатка"),
+    seller_id: int | None = Query(None, description="ID продавца для фильтрации"),
+    db: AsyncSession = Depends(get_async_db),
+):
+    if min_price is not None and max_price is not None and min_price > max_price:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="min_price не может быть больше max_price",
+        )
+
+    filters = [ProductModel.is_active.is_(True)]
+
+    if category_id is not None:
+        filters.append(ProductModel.category_id == category_id)
+    if min_price is not None:
+        filters.append(ProductModel.price >= min_price)
+    if max_price is not None:
+        filters.append(ProductModel.price <= max_price)
+    if in_stock is not None:
+        filters.append(ProductModel.stock > 0 if in_stock else ProductModel.stock == 0)
+    if seller_id is not None:
+        filters.append(ProductModel.seller_id == seller_id)
+
+    # Базовый запрос total
+    total_stmt = select(func.count()).select_from(ProductModel).where(*filters)
+
+    rank_col = None
+    if search:
+        search_value = search.strip()
+        if search_value:
+            # строим два tsquery для одной и той же фразы
+            ts_query_en = func.websearch_to_tsquery('english', search_value)
+            ts_query_ru = func.websearch_to_tsquery('russian', search_value)
+
+            # Ищем совпадение в любой конфигурации и добавляем в общий фильтр
+            ts_match_any = or_(
+                ProductModel.tsv.op('@@')(ts_query_en),
+                ProductModel.tsv.op('@@')(ts_query_ru),
+            )
+            filters.append(ts_match_any)
+
+            # берем ранг максимальный из двух
+            rank_col = func.greatest(
+                func.ts_rank_cd(ProductModel.tsv, ts_query_en),
+                func.ts_rank_cd(ProductModel.tsv, ts_query_ru),
+            ).label("rank")
+
+            # total с учетом полнотекстового фильтра
+            total_stmt = select(func.count()).select_from(ProductModel).where(*filters)
+
+    total = await db.scalar(total_stmt) or 0
+
+    # Основной запрос (если есть поиск — добавим ранг в выборку и сортировку)
+    if rank_col is not None:
+        products_stmt = (
+            select(ProductModel, rank_col)
+            .where(*filters)
+            .order_by(desc(rank_col), ProductModel.id)
+            .offset((page - 1) * page_size)
+            .limit(page_size)
+        )
+        result = await db.execute(products_stmt)
+        rows = result.all()
+        items = [row[0] for row in rows]    # сами объекты
+        # при желании можно вернуть ранг в ответе
+        # ranks = [row.rank for row in rows]
+    else:
+        products_stmt = (
+            select(ProductModel)
+            .where(*filters)
+            .order_by(ProductModel.id)
+            .offset((page - 1) * page_size)
+            .limit(page_size)
+        )
+        items = (await db.scalars(products_stmt)).all()
+
+    return {
+        "items": items,
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+    }
 
 
 @router.get("/category/{category_id}", response_model=list[ProductSchema])
@@ -68,39 +150,6 @@ async def get_products_by_category(category_id: int, db: AsyncSession = Depends(
         select(ProductModel).where(ProductModel.category_id == category_id, ProductModel.is_active == True)
     )
     return product_result.all()
-
-
-@router.get("/{product_id}/reviews/", response_model=list[ReviewSchema])
-async def get_product_reviews(
-    product_id: int,
-    db: AsyncSession = Depends(get_async_db)
-):
-    """
-    Возвращает список активных отзывов для указанного товара.
-    Доступ: Разрешён всем (аутентификация не требуется).
-    """
-    # Проверяем, существует ли активный товар
-    product_result = await db.scalars(
-        select(ProductModel).where(
-            ProductModel.id == product_id,
-            ProductModel.is_active == True
-        )
-    )
-    product = product_result.first()
-    if not product:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Product not found or inactive"
-        )
-    
-    # Получаем активные отзывы для товара
-    reviews_result = await db.scalars(
-        select(ReviewModel).where(
-            ReviewModel.product_id == product_id,
-            ReviewModel.is_active == True
-        )
-    )
-    return reviews_result.all()
 
 
 @router.get("/{product_id}", response_model=ProductSchema)

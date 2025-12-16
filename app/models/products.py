@@ -1,7 +1,9 @@
 from decimal import Decimal
 from typing import TYPE_CHECKING
-from sqlalchemy import ForeignKey, String, Boolean, Integer, Numeric, Float, text
+from sqlalchemy import Computed, ForeignKey, Index, String, Boolean, Integer, Numeric, Float, text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
+
+from sqlalchemy.dialects.postgresql import TSVECTOR
 
 from app.database import Base
 
@@ -23,6 +25,27 @@ class Product(Base):
     seller_id: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=False)
     rating: Mapped[float] = mapped_column(Float, default=0.0, server_default=text('0'))
     
-    category: Mapped["Category"] = relationship(back_populates="products")
-    seller: Mapped["User"] = relationship(back_populates="products")
+    
+    tsv: Mapped[TSVECTOR] = mapped_column(
+        TSVECTOR,
+        Computed(
+            """
+            setweight(to_tsvector('english', coalesce(name, '')), 'A')
+            || setweight(to_tsvector('russian', coalesce(name, '')), 'A')
+            || setweight(to_tsvector('english', coalesce(description, '')), 'B')
+            || setweight(to_tsvector('russian', coalesce(description, '')), 'B')
+            """,
+            persisted=True,
+        ),
+        nullable=False,
+    )
+
+    category: Mapped["Category"] = relationship("Category", back_populates="products")
+    seller = relationship("User", back_populates="products")
     reviews: Mapped[list["Review"]] = relationship("Review", back_populates="product")
+
+    
+
+    __table_args__ = (
+        Index("ix_products_tsv_gin", "tsv", postgresql_using="gin"),
+    )
